@@ -111,6 +111,35 @@ export function TerminalView({ session, isActive, viewMode, onSessionState, onSe
     }
     termRef.current = term;
 
+    // Workaround: xterm.js 6.0.0 has a bug in its built-in requestMode
+    // (DECRPM) handler where minified code references an undefined variable
+    // `i`, causing a crash. This prevents DECRPM responses from reaching TUI
+    // programs like opencode/bubbletea, which then hang waiting for a reply.
+    // We register custom CSI handlers that run *before* the buggy built-in
+    // one, generate the correct "not recognized" response, and return true
+    // to suppress the broken default handler.
+    // CSI ? Ps $ p  (private mode DECRQM)
+    term.parser.registerCsiHandler(
+      { prefix: "?", intermediates: "$", final: "p" },
+      (params) => {
+        const mode = params[0] ?? 0;
+        // Reply: CSI ? mode ; 0 $ y  (0 = not recognized)
+        // This is safe: bubbletea treats "not recognized" the same as no
+        // response, but crucially it unblocks the query wait immediately.
+        term.input(`\x1b[?${mode};0$y`, false);
+        return true; // suppress built-in (buggy) handler
+      }
+    );
+    // CSI Ps $ p  (ANSI mode DECRQM)
+    term.parser.registerCsiHandler(
+      { intermediates: "$", final: "p" },
+      (params) => {
+        const mode = params[0] ?? 0;
+        term.input(`\x1b[${mode};0$y`, false);
+        return true;
+      }
+    );
+
     // Mobile: bridge touch → term.scrollLines() (xterm.js doesn't natively handle touch scroll with WebGL/Canvas).
     let removeTouchScroll: (() => void) | null = null;
     if (isMobile && fitTargetRef.current) {
