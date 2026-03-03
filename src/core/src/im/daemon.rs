@@ -1,5 +1,5 @@
 //! Per-channel outbound: one FIFO queue and one send daemon task per channel.
-//! Stream-edit (send then edit in place) or response-parts FIFO (Feishu: one message per Claude segment).
+//! Stream-edit (send then edit in place), buffer (accumulate then send on end), or passthrough (web chat).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -10,22 +10,37 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::log::{prefix, truncate_content_default};
-use super::transport::{ImChannelCapabilities, ImTransport, SendError};
+use super::transport::{ImChannelCapabilities, ImTransport, InteractiveOption, SendError};
 use crate::im::transport;
 
-/// Outbound queue item: stream progress (label), stream part (text block), stream edit (legacy), stream end, or send.
+/// Outbound queue item.
 #[derive(Debug, Clone)]
 pub enum OutboundMsg {
-    /// Progress label only (e.g. "Thinking..."). Edit: show until we have text; no-edit: push as one part.
+    /// Progress label only (e.g. "Thinking...").
     StreamProgress(String, String),
-    /// One text segment from Claude. No-edit: push to response FIFO; edit: append and edit in place.
+    /// One text segment from agent.
     StreamPart(String, String),
     /// Legacy: single content update (edit channel). Throttled.
     StreamEdit(String, String),
-    /// End stream: flush edit or drain response FIFO.
+    /// End stream: flush buffer or drain response FIFO.
     StreamEnd(String),
     /// Send as a new message. Rate-limited.
     Send(String, String),
+    /// Send as a reply to a specific message.
+    Reply(String, String, String), // channel_id, reply_to_message_id, text
+    /// Add a reaction to a message.
+    AddReaction(String, String, String), // channel_id, message_id, emoji
+    /// Remove a reaction from a message.
+    RemoveReaction(String, String, String), // channel_id, message_id, reaction_id
+    /// Set the reply_to message_id for buffer mode (first flushed message quotes the user).
+    SetReplyTo(String, String), // channel_id, reply_to_message_id
+    /// Send an interactive card/inline keyboard.
+    SendInteractive {
+        channel_id: String,
+        prompt: String,
+        options: Vec<InteractiveOption>,
+        reply_to: Option<String>,
+    },
 }
 
 /// Per-channel state.
@@ -43,6 +58,14 @@ struct ChannelSendState {
     last_progress: Option<String>,
     /// For !supports_stream_edit: FIFO of segments to send. Each sent with rate limit; if part > max_len, split into multiple messages.
     response_parts: VecDeque<String>,
+    /// For buffer mode: accumulated text blocks, sent as complete messages on StreamEnd.
+    buffer_parts: Vec<String>,
+    /// For buffer mode: the reply_to message_id for the first reply.
+    reply_to_message_id: Option<String>,
+    /// Last reaction_id returned by add_reaction (for remove_reaction).
+    last_reaction_id: Option<String>,
+    /// The message_id that the last reaction was added to.
+    last_reaction_message_id: Option<String>,
 }
 
 const MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,7 +123,7 @@ async fn drain_one_response_part<T: ImTransport>(
                     "{} chat_id={} direction=send part content={} error={}",
                     prefix(channel_id),
                     channel_id,
-                    truncate_content_default(chunk),
+                    truncate_content_default(&chunk),
                     e
                 );
                 return true;
@@ -114,8 +137,75 @@ async fn drain_one_response_part<T: ImTransport>(
     true
 }
 
+/// Flush buffered content: join all buffer_parts, chunk, and send (first as reply if reply_to set).
+async fn flush_buffer<T: ImTransport>(
+    channel_id: &str,
+    state: &mut ChannelSendState,
+    transport: &Arc<T>,
+    max_len: usize,
+) {
+    if state.buffer_parts.is_empty() {
+        return;
+    }
+    let full_text = state.buffer_parts.drain(..).collect::<String>();
+    if full_text.trim().is_empty() {
+        return;
+    }
+    let chunks = transport::chunk_message(&full_text, max_len);
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Rate limit
+        let now = Instant::now();
+        let wait_until = state
+            .retry_after
+            .filter(|t| *t > now)
+            .or_else(|| {
+                state.last_send.and_then(|t| {
+                    let next = t + MIN_INTERVAL;
+                    if next > now { Some(next) } else { None }
+                })
+            });
+        if let Some(until) = wait_until {
+            tokio::time::sleep_until(until).await;
+        }
+        // First chunk: reply to user message if available
+        let result = if i == 0 {
+            if let Some(ref reply_to) = state.reply_to_message_id {
+                transport.reply(channel_id, reply_to, chunk).await
+            } else {
+                transport.send(channel_id, chunk).await
+            }
+        } else {
+            transport.send(channel_id, chunk).await
+        };
+        match result {
+            Ok(_) => {
+                state.last_send = Some(Instant::now());
+                state.retry_after = None;
+            }
+            Err(SendError::RateLimited { retry_after_secs }) => {
+                state.retry_after = Some(Instant::now() + Duration::from_secs_f64(retry_after_secs));
+                // Re-queue remaining chunks
+                for j in (i + 1..chunks.len()).rev() {
+                    state.response_parts.push_front(chunks[j].clone());
+                }
+                break;
+            }
+            Err(SendError::Other(e)) => {
+                eprintln!("{} chat_id={} direction=send buffer content={} error={}", prefix(channel_id), channel_id, truncate_content_default(chunk), e);
+            }
+        }
+        if i + 1 < chunks.len() {
+            tokio::time::sleep_until(Instant::now() + MIN_INTERVAL).await;
+        }
+    }
+    state.reply_to_message_id = None;
+}
+
 /// One send daemon for a single channel: drains that channel's FIFO queue, applies rate limit and stream-edit.
-/// Branches on transport capabilities: supports_stream_edit => send then edit in place; else => buffer and send once on StreamEnd.
+/// Branches on transport capabilities:
+///   buffer_stream => accumulate all parts, send as complete messages on StreamEnd
+///   supports_stream_edit => send then edit in place
+///   else => buffer and send once on StreamEnd (no-edit passthrough)
 async fn run_send_daemon_for_channel<T>(
     mut rx: mpsc::Receiver<OutboundMsg>,
     tx: mpsc::Sender<OutboundMsg>,
@@ -135,11 +225,19 @@ async fn run_send_daemon_for_channel<T>(
         pending_stream_text: None,
         last_progress: None,
         response_parts: VecDeque::new(),
+        buffer_parts: Vec::new(),
+        reply_to_message_id: None,
+        last_reaction_id: None,
+        last_reaction_message_id: None,
     };
 
     while let Some(msg) = rx.recv().await {
         match msg {
             OutboundMsg::StreamProgress(_, label) => {
+                if caps.buffer_stream {
+                    // Buffer mode: skip progress labels, they'll be shown via reaction
+                    continue;
+                }
                 if caps.supports_stream_edit {
                     state.last_progress = Some(label.clone());
                     let to_show = state.pending_stream_text.as_deref().unwrap_or(&label);
@@ -161,9 +259,14 @@ async fn run_send_daemon_for_channel<T>(
                         }
                     }
                 }
-                // No-edit channel: skip progress (Thinking... / Using tool: X...); only text parts are sent.
+                // No-edit, no-buffer channel: skip progress
             }
             OutboundMsg::StreamPart(_, text) => {
+                if caps.buffer_stream {
+                    // Buffer mode: accumulate text, don't send yet
+                    state.buffer_parts.push(text);
+                    continue;
+                }
                 if caps.supports_stream_edit {
                     state.last_progress = None;
                     let acc = state.pending_stream_text.take().unwrap_or_default();
@@ -193,6 +296,10 @@ async fn run_send_daemon_for_channel<T>(
                 }
             }
             OutboundMsg::StreamEdit(_, text) => {
+                if caps.buffer_stream {
+                    state.buffer_parts.push(text);
+                    continue;
+                }
                 if !caps.supports_stream_edit {
                     state.response_parts.push_back(text);
                     while drain_one_response_part(&channel_id, &mut state, &transport, max_len).await
@@ -224,7 +331,6 @@ async fn run_send_daemon_for_channel<T>(
                         state.pending_stream_text = Some(text);
                     }
                 } else if state.stream_sent {
-                    // Sent but no message_id (no edit support) — just buffer
                     state.pending_stream_text = Some(text);
                 } else {
                     match transport.send(&channel_id, &text).await {
@@ -246,6 +352,22 @@ async fn run_send_daemon_for_channel<T>(
                 }
             }
             OutboundMsg::StreamEnd(_) => {
+                if caps.buffer_stream {
+                    // Buffer mode: flush all accumulated content
+                    flush_buffer(&channel_id, &mut state, &transport, max_len).await;
+                    // Also drain any remaining response_parts
+                    while !state.response_parts.is_empty() {
+                        if !drain_one_response_part(&channel_id, &mut state, &transport, max_len).await {
+                            break;
+                        }
+                    }
+                    state.buffer_parts.clear();
+                    state.stream_sent = false;
+                    state.stream_message_id = None;
+                    state.pending_stream_text = None;
+                    state.last_progress = None;
+                    continue;
+                }
                 if !caps.supports_stream_edit {
                     while !state.response_parts.is_empty() {
                         if !drain_one_response_part(&channel_id, &mut state, &transport, max_len).await
@@ -310,6 +432,81 @@ async fn run_send_daemon_for_channel<T>(
                     }
                 }
             }
+            OutboundMsg::Reply(_, reply_to, text) => {
+                let now = Instant::now();
+                let wait_until = state.retry_after.filter(|t| *t > now).or_else(|| {
+                    state.last_send.and_then(|t| {
+                        let next = t + MIN_INTERVAL;
+                        if next > now { Some(next) } else { None }
+                    })
+                });
+                if let Some(until) = wait_until {
+                    tokio::time::sleep_until(until).await;
+                }
+                match transport.reply(&channel_id, &reply_to, &text).await {
+                    Ok(_) => { state.last_send = Some(Instant::now()); state.retry_after = None; }
+                    Err(SendError::RateLimited { retry_after_secs }) => {
+                        state.retry_after = Some(Instant::now() + Duration::from_secs_f64(retry_after_secs));
+                        let _ = tx.send(OutboundMsg::Reply(channel_id.clone(), reply_to, text)).await;
+                    }
+                    Err(SendError::Other(e)) => {
+                        eprintln!("{} chat_id={} direction=reply error={}", prefix(&channel_id), channel_id, e);
+                    }
+                }
+            }
+            OutboundMsg::AddReaction(_, message_id, emoji) => {
+                match transport.add_reaction(&channel_id, &message_id, &emoji).await {
+                    Ok(Some(rid)) => {
+                        state.last_reaction_id = Some(rid);
+                        state.last_reaction_message_id = Some(message_id);
+                    }
+                    Ok(None) => {
+                        // Platform didn't return a reaction_id (e.g. Telegram uses emoji as id)
+                        state.last_reaction_id = Some(emoji.clone());
+                        state.last_reaction_message_id = Some(message_id);
+                    }
+                    Err(e) => {
+                        eprintln!("{} chat_id={} direction=add_reaction error={:?}", prefix(&channel_id), channel_id, e);
+                    }
+                }
+            }
+            OutboundMsg::RemoveReaction(_, message_id, _reaction_id_hint) => {
+                // Use the stored reaction_id from the last AddReaction if the message matches
+                let (mid, rid) = if state.last_reaction_message_id.as_deref() == Some(&message_id) {
+                    if let Some(rid) = state.last_reaction_id.take() {
+                        state.last_reaction_message_id = None;
+                        (message_id, rid)
+                    } else {
+                        (message_id, _reaction_id_hint)
+                    }
+                } else {
+                    (message_id, _reaction_id_hint)
+                };
+                if let Err(e) = transport.remove_reaction(&channel_id, &mid, &rid).await {
+                    eprintln!("{} chat_id={} direction=remove_reaction error={:?}", prefix(&channel_id), channel_id, e);
+                }
+            }
+            OutboundMsg::SetReplyTo(_, reply_to) => {
+                state.reply_to_message_id = Some(reply_to);
+            }
+            OutboundMsg::SendInteractive { prompt, options, reply_to, .. } => {
+                let now = Instant::now();
+                let wait_until = state.retry_after.filter(|t| *t > now).or_else(|| {
+                    state.last_send.and_then(|t| {
+                        let next = t + MIN_INTERVAL;
+                        if next > now { Some(next) } else { None }
+                    })
+                });
+                if let Some(until) = wait_until {
+                    tokio::time::sleep_until(until).await;
+                }
+                match transport.send_interactive(&channel_id, &prompt, &options, reply_to.as_deref()).await {
+                    Ok(_) => { state.last_send = Some(Instant::now()); }
+                    Err(e) => {
+                        eprintln!("{} chat_id={} direction=send_interactive error={:?}", prefix(&channel_id), channel_id, e);
+                    }
+                }
+            }
         }
     }
 }
@@ -349,6 +546,15 @@ where
     pub async fn send(&self, channel_id: &str, msg: OutboundMsg) {
         let tx = self.sender_for(channel_id);
         let _ = tx.send(msg).await;
+    }
+
+    /// Set the reply_to message_id for buffer mode (so first flushed message quotes the user).
+    /// This is a hint stored in the daemon state via a special message.
+    pub async fn set_reply_to(&self, channel_id: &str, reply_to_message_id: String) {
+        let tx = self.sender_for(channel_id);
+        let _ = tx.send(OutboundMsg::SetReplyTo(
+            channel_id.to_string(), reply_to_message_id,
+        )).await;
     }
 
     /// Max message length for this transport (used by worker for truncation and chunking).

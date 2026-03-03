@@ -43,10 +43,14 @@ impl AgentKind {
 pub enum AgentEvent {
     /// Assistant text chunk (streaming).
     Text(String),
+    /// Thinking / reasoning text chunk.
+    Thinking(String),
     /// Progress indicator: "Thinking...", "Using tool: Bash", etc.
     Progress(String),
-    /// A tool call started.
-    ToolUse { name: String },
+    /// A tool call started (with optional input JSON).
+    ToolUse { name: String, id: String, input: Option<String> },
+    /// A tool call produced a result.
+    ToolResult { id: String, output: Option<String>, is_error: bool },
     /// The agent's turn is complete.
     TurnComplete {
         session_id: Option<String>,
@@ -351,14 +355,44 @@ impl agent_client_protocol::Client for SharedAcpClientHandler {
                     let _ = self.event_tx.send(AgentEvent::Text(t.text));
                 }
             }
-            SessionUpdate::AgentThoughtChunk(_) => {
-                let _ = self.event_tx.send(AgentEvent::Progress("Thinking...".into()));
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                if let ContentBlock::Text(t) = chunk.content {
+                    let _ = self.event_tx.send(AgentEvent::Thinking(t.text));
+                }
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                if let Some(ref title) = update.fields.title {
-                    let _ = self.event_tx.send(AgentEvent::ToolUse {
-                        name: title.clone(),
+                let name = update.fields.title.clone().unwrap_or_else(|| "unknown".into());
+                let id = update.tool_call_id.to_string();
+                // Check if this is a completed tool call (has status or raw_output)
+                let has_output = update.fields.raw_output.is_some();
+                let status_completed = update.fields.status.as_ref().map(|s| {
+                    matches!(s, agent_client_protocol::ToolCallStatus::Completed | agent_client_protocol::ToolCallStatus::Failed)
+                }).unwrap_or(false);
+
+                if has_output || status_completed {
+                    // This is a tool result update
+                    let output = update.fields.raw_output.as_ref().map(|v| {
+                        if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() }
+                    }).or_else(|| {
+                        update.fields.content.as_ref().map(|blocks| {
+                            blocks.iter().filter_map(|block| {
+                                match block {
+                                    agent_client_protocol::ToolCallContent::Content(c) => {
+                                        if let ContentBlock::Text(t) = &c.content { Some(t.text.clone()) } else { None }
+                                    }
+                                    _ => None,
+                                }
+                            }).collect::<Vec<_>>().join("")
+                        })
                     });
+                    let is_error = matches!(update.fields.status.as_ref(), Some(agent_client_protocol::ToolCallStatus::Failed));
+                    let _ = self.event_tx.send(AgentEvent::ToolResult { id, output, is_error });
+                } else {
+                    // This is a tool use start/progress update
+                    let input = update.fields.raw_input.as_ref().map(|v| {
+                        if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() }
+                    });
+                    let _ = self.event_tx.send(AgentEvent::ToolUse { name, id, input });
                 }
             }
             _ => {}

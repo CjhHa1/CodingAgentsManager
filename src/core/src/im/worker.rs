@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use super::daemon::{OutboundHub, OutboundMsg};
 use crate::agent::{self, AgentBackend, AgentEvent, AgentKind};
-use crate::config;
+use crate::config::{self, ImVerboseConfig};
 
 /// Attachment metadata from Feishu file/image messages.
 #[derive(Debug, Clone)]
@@ -30,11 +30,13 @@ pub struct InboundMessage {
     pub text: String,
     pub attachments: Vec<FeishuAttachment>,
     pub parent_id: Option<String>,
+    /// The platform message_id of the user's message (for reactions and reply-quoting).
+    pub user_message_id: Option<String>,
 }
 
 impl InboundMessage {
     pub fn text_only(channel_id: String, text: String) -> Self {
-        Self { channel_id, text, attachments: vec![], parent_id: None }
+        Self { channel_id, text, attachments: vec![], parent_id: None, user_message_id: None }
     }
 }
 
@@ -43,6 +45,7 @@ pub async fn run_worker<T>(
     outbound: Arc<OutboundHub<T>>,
     busy_set: Arc<DashMap<String, ()>>,
     _feishu_transport: Option<Arc<crate::im::channels::feishu::FeishuTransport>>,
+    verbose: ImVerboseConfig,
 ) where
     T: crate::im::transport::ImTransport + 'static,
 {
@@ -75,7 +78,7 @@ pub async fn run_worker<T>(
 
         // --- Send message to agent ---
         let agent = active_agent.as_ref().unwrap();
-        run_with_agent(agent.as_ref(), &msg, &channel_id, &outbound).await;
+        run_with_agent(agent.as_ref(), &msg, &channel_id, &outbound, &verbose).await;
 
         busy_set.remove(&channel_id);
     }
@@ -124,46 +127,154 @@ async fn switch_agent<T>(
     let _ = outbound.send(channel_id, OutboundMsg::StreamEnd(channel_id.to_string())).await;
 }
 
+/// Truncate tool output for display in IM (avoid flooding).
+fn truncate_tool_output(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        text.to_string()
+    } else {
+        format!("{}…({} bytes)", &text[..max_len], text.len())
+    }
+}
+
 /// Send a message to the active agent and stream events back to IM.
+/// Emits all agent output: text, thinking, tool calls, tool results.
+/// Uses reactions to indicate processing state and reply-quotes the user message.
 async fn run_with_agent<T>(
     agent: &dyn AgentBackend,
     msg: &InboundMessage,
     channel_id: &str,
     outbound: &Arc<OutboundHub<T>>,
+    verbose: &ImVerboseConfig,
 ) where
     T: crate::im::transport::ImTransport + 'static,
 {
+    let caps = outbound.capabilities();
     let mut rx = agent.subscribe();
+
+    // Add a reaction to indicate we're processing (if user_message_id available)
+    let reaction_info: Option<(String, Option<String>)> = if let Some(ref user_mid) = msg.user_message_id {
+        let _ = outbound.send(channel_id, OutboundMsg::AddReaction(
+            channel_id.to_string(), user_mid.clone(), "👀".to_string(),
+        )).await;
+        // Set reply_to so buffer flush will quote the user's message
+        outbound.set_reply_to(channel_id, user_mid.clone()).await;
+        Some((user_mid.clone(), None))
+    } else {
+        None
+    };
 
     if let Err(e) = agent.send_message(&msg.text).await {
         let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
             channel_id.to_string(), format!("[Agent error: {}]", e),
         )).await;
         let _ = outbound.send(channel_id, OutboundMsg::StreamEnd(channel_id.to_string())).await;
+        remove_processing_reaction(channel_id, &reaction_info, outbound).await;
         return;
+    }
+
+    // Track current block type so we can flush buffer between different content types.
+    // Each block (thinking, text, tool_use, tool_result) becomes a separate IM message.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Block { None, Thinking, Text, Tool }
+    let mut current_block = Block::None;
+
+    /// Flush the current buffer block (sends StreamEnd so daemon flushes accumulated parts).
+    async fn flush_block<T2: crate::im::transport::ImTransport + 'static>(
+        channel_id: &str, outbound: &Arc<OutboundHub<T2>>,
+    ) {
+        let _ = outbound.send(channel_id, OutboundMsg::StreamEnd(channel_id.to_string())).await;
     }
 
     loop {
         match rx.recv().await {
             Ok(event) => match event {
                 AgentEvent::Text(text) => {
+                    if current_block != Block::Text {
+                        if current_block != Block::None {
+                            flush_block(channel_id, outbound).await;
+                        }
+                        current_block = Block::Text;
+                    }
                     let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
                         channel_id.to_string(), text,
                     )).await;
+                }
+                AgentEvent::Thinking(text) => {
+                    if !verbose.show_thinking {
+                        // Skip thinking blocks entirely when not configured to show them
+                        continue;
+                    }
+                    if current_block != Block::Thinking {
+                        if current_block != Block::None {
+                            flush_block(channel_id, outbound).await;
+                        }
+                        current_block = Block::Thinking;
+                        let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
+                            channel_id.to_string(), "💭 *Thinking...*\n".to_string(),
+                        )).await;
+                    }
+                    if caps.buffer_stream {
+                        let summary = truncate_tool_output(&text, 200);
+                        let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
+                            channel_id.to_string(), format!("> {}\n", summary),
+                        )).await;
+                    } else {
+                        let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
+                            channel_id.to_string(), text,
+                        )).await;
+                    }
                 }
                 AgentEvent::Progress(status) => {
                     let _ = outbound.send(channel_id, OutboundMsg::StreamProgress(
                         channel_id.to_string(), status,
                     )).await;
                 }
-                AgentEvent::ToolUse { name } => {
-                    let _ = outbound.send(channel_id, OutboundMsg::StreamProgress(
-                        channel_id.to_string(), format!("🔧 {}...", name),
+                AgentEvent::ToolUse { name, id: _, input } => {
+                    if !verbose.show_tool_use {
+                        continue;
+                    }
+                    if current_block != Block::None {
+                        flush_block(channel_id, outbound).await;
+                    }
+                    current_block = Block::Tool;
+                    let mut tool_msg = format!("🔧 **{}**", name);
+                    if let Some(ref inp) = input {
+                        let summary = truncate_tool_output(inp, 300);
+                        tool_msg.push_str(&format!("\n```\n{}\n```", summary));
+                    }
+                    tool_msg.push('\n');
+                    let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
+                        channel_id.to_string(), tool_msg,
+                    )).await;
+                }
+                AgentEvent::ToolResult { id: _, output, is_error } => {
+                    if !verbose.show_tool_use {
+                        continue;
+                    }
+                    // Tool result always flushes previous block and sends as its own message
+                    if current_block != Block::None {
+                        flush_block(channel_id, outbound).await;
+                    }
+                    current_block = Block::Tool;
+                    let pfx = if is_error { "❌" } else { "✅" };
+                    let mut result_msg = format!("{} Tool result", pfx);
+                    if let Some(ref out) = output {
+                        let summary = truncate_tool_output(out, 500);
+                        if !summary.is_empty() {
+                            result_msg.push_str(&format!(":\n```\n{}\n```", summary));
+                        }
+                    }
+                    result_msg.push('\n');
+                    let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
+                        channel_id.to_string(), result_msg,
                     )).await;
                 }
                 AgentEvent::TurnComplete { cost_usd, .. } => {
                     if let Some(cost) = cost_usd {
-                        let _ = outbound.send(channel_id, OutboundMsg::StreamProgress(
+                        if current_block != Block::None {
+                            flush_block(channel_id, outbound).await;
+                        }
+                        let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
                             channel_id.to_string(), format!("💰 ${:.4}", cost),
                         )).await;
                     }
@@ -171,7 +282,7 @@ async fn run_with_agent<T>(
                 }
                 AgentEvent::Error(err) => {
                     let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
-                        channel_id.to_string(), format!("[Error: {}]", err),
+                        channel_id.to_string(), format!("[Error: {}]\n", err),
                     )).await;
                 }
             },
@@ -180,7 +291,7 @@ async fn run_with_agent<T>(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
-                    channel_id.to_string(), "[Agent process ended unexpectedly]".to_string(),
+                    channel_id.to_string(), "[Agent process ended unexpectedly]\n".to_string(),
                 )).await;
                 break;
             }
@@ -188,4 +299,23 @@ async fn run_with_agent<T>(
     }
 
     let _ = outbound.send(channel_id, OutboundMsg::StreamEnd(channel_id.to_string())).await;
+
+    // Remove processing reaction
+    remove_processing_reaction(channel_id, &reaction_info, outbound).await;
+}
+
+/// Remove the 👀 processing reaction when done.
+async fn remove_processing_reaction<T>(
+    channel_id: &str,
+    reaction_info: &Option<(String, Option<String>)>,
+    outbound: &Arc<OutboundHub<T>>,
+) where
+    T: crate::im::transport::ImTransport + 'static,
+{
+    if let Some((ref user_mid, ref reaction_id)) = reaction_info {
+        let rid = reaction_id.as_deref().unwrap_or("👀");
+        let _ = outbound.send(channel_id, OutboundMsg::RemoveReaction(
+            channel_id.to_string(), user_mid.clone(), rid.to_string(),
+        )).await;
+    }
 }
