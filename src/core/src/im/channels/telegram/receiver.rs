@@ -12,66 +12,130 @@ use crate::im::log::{prefix_channel, truncate_content_default};
 
 const TELEGRAM_API_GET_ME: &str = "https://api.telegram.org/bot";
 
-/// Run the Telegram receiver (long polling). Pushes InboundMessage to inbound_tx when the
-/// chat is not busy; pushes "Please wait..." to outbound when busy.
+/// Run the Telegram receiver (long polling). Handles both messages and callback_query (inline buttons).
 pub async fn run_telegram_receiver(
     bot: Bot,
     inbound_tx: mpsc::Sender<crate::im::worker::InboundMessage>,
     outbound: Arc<crate::im::daemon::OutboundHub<TelegramTransport>>,
     busy_set: Arc<DashMap<String, ()>>,
 ) {
+    let inbound_tx = Arc::new(inbound_tx);
     let outbound = outbound.clone();
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let inbound_tx = inbound_tx.clone();
-        let outbound = outbound.clone();
-        let busy_set = busy_set.clone();
+    let busy_set = busy_set.clone();
 
-        async move {
-            let chat_id = msg.chat.id;
-            let channel_id = format!("telegram:{}", chat_id.0);
-            let user_log = format_user(&msg);
-            let user_message_id = Some(msg.id.0.to_string());
-
-            let text = match msg.text() {
-                Some(t) => t.trim().to_string(),
-                None => {
-                    eprintln!("{} chat_id={} from={} direction=incoming content=(non-text, ignored)",
-                        prefix_channel("telegram"), chat_id.0, user_log);
-                    let _ = outbound.send(&channel_id, OutboundMsg::Send(
-                        channel_id.clone(), "Send me a text message.".to_string())).await;
-                    return Ok(());
-                }
-            };
-            if text.is_empty() {
-                eprintln!("{} chat_id={} from={} direction=incoming content=(empty)",
-                    prefix_channel("telegram"), chat_id.0, user_log);
-                let _ = outbound.send(&channel_id, OutboundMsg::Send(
-                    channel_id.clone(), "Send me a non-empty message.".to_string())).await;
-                return Ok(());
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint({
+            let inbound_tx = inbound_tx.clone();
+            let outbound = outbound.clone();
+            let busy_set = busy_set.clone();
+            move |bot: Bot, msg: Message| {
+                let inbound_tx = inbound_tx.clone();
+                let outbound = outbound.clone();
+                let busy_set = busy_set.clone();
+                async move { handle_message(bot, msg, inbound_tx, outbound, busy_set).await }
             }
-
-            eprintln!("{} chat_id={} from={} direction=incoming content={}",
-                prefix_channel("telegram"), chat_id.0, user_log, truncate_content_default(&text));
-
-            let _ = bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
-
-            if busy_set.contains_key(&channel_id) {
-                let _ = outbound.send(&channel_id, OutboundMsg::Send(
-                    channel_id.clone(), "Please wait for the current task to finish.".to_string())).await;
-                return Ok(());
+        }))
+        .branch(Update::filter_callback_query().endpoint({
+            let inbound_tx = inbound_tx.clone();
+            let outbound = outbound.clone();
+            let busy_set = busy_set.clone();
+            move |bot: Bot, q: CallbackQuery| {
+                let inbound_tx = inbound_tx.clone();
+                let outbound = outbound.clone();
+                let busy_set = busy_set.clone();
+                async move { handle_callback_query(bot, q, inbound_tx, outbound, busy_set).await }
             }
+        }));
 
-            let _ = inbound_tx.send(crate::im::worker::InboundMessage {
-                channel_id,
-                text,
-                attachments: vec![],
-                parent_id: None,
-                user_message_id,
-            }).await;
-            Ok(())
+    Dispatcher::builder(bot, handler)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+}
+
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    inbound_tx: Arc<mpsc::Sender<crate::im::worker::InboundMessage>>,
+    outbound: Arc<crate::im::daemon::OutboundHub<TelegramTransport>>,
+    busy_set: Arc<DashMap<String, ()>>,
+) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
+    let channel_id = format!("telegram:{}", chat_id.0);
+    let user_log = format_user(&msg);
+    let user_message_id = Some(msg.id.0.to_string());
+
+    let text = match msg.text() {
+        Some(t) => t.trim().to_string(),
+        None => {
+            eprintln!("{} chat_id={} from={} direction=incoming content=(non-text, ignored)",
+                prefix_channel("telegram"), chat_id.0, user_log);
+            let _ = outbound.send(&channel_id, OutboundMsg::Send(
+                channel_id.clone(), "Send me a text message.".to_string())).await;
+            return Ok(());
         }
-    })
-    .await;
+    };
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("{} chat_id={} from={} direction=incoming content={}",
+        prefix_channel("telegram"), chat_id.0, user_log, truncate_content_default(&text));
+
+    let _ = bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
+
+    if busy_set.contains_key(&channel_id) {
+        let _ = outbound.send(&channel_id, OutboundMsg::Send(
+            channel_id.clone(), "Please wait for the current task to finish.".to_string())).await;
+        return Ok(());
+    }
+
+    let _ = inbound_tx.send(crate::im::worker::InboundMessage {
+        channel_id, text, attachments: vec![], parent_id: None, user_message_id,
+    }).await;
+    Ok(())
+}
+
+async fn handle_callback_query(
+    bot: Bot,
+    q: CallbackQuery,
+    inbound_tx: Arc<mpsc::Sender<crate::im::worker::InboundMessage>>,
+    outbound: Arc<crate::im::daemon::OutboundHub<TelegramTransport>>,
+    busy_set: Arc<DashMap<String, ()>>,
+) -> ResponseResult<()> {
+    // Always answer the callback query first to stop the loading spinner
+    let _ = bot.answer_callback_query(q.id.clone()).await;
+
+    let data = match q.data {
+        Some(ref d) if !d.is_empty() => d.clone(),
+        _ => return Ok(()),
+    };
+
+    let chat_id = match q.message.as_ref() {
+        Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) => m.chat.id,
+        Some(teloxide::types::MaybeInaccessibleMessage::Inaccessible(m)) => m.chat.id,
+        None => return Ok(()),
+    };
+    let channel_id = format!("telegram:{}", chat_id.0);
+
+    eprintln!("{} chat_id={} direction=callback_query data={}",
+        prefix_channel("telegram"), chat_id.0, truncate_content_default(&data));
+
+    if busy_set.contains_key(&channel_id) {
+        let _ = outbound.send(&channel_id, OutboundMsg::Send(
+            channel_id.clone(), "Please wait for the current task to finish.".to_string())).await;
+        return Ok(());
+    }
+
+    let _ = inbound_tx.send(crate::im::worker::InboundMessage {
+        channel_id,
+        text: data,
+        attachments: vec![],
+        parent_id: None,
+        user_message_id: None,
+    }).await;
+    Ok(())
 }
 
 fn format_user(msg: &Message) -> String {

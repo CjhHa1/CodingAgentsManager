@@ -148,6 +148,8 @@ impl ImTransport for FeishuTransport {
             buffer_stream: true,
             max_message_len: FEISHU_MAX_MESSAGE_LEN,
             channel_id_prefix: "feishu",
+            processing_reaction: "OneSecond",
+            done_reaction: "CheckMark",
         }
     }
 
@@ -225,9 +227,8 @@ impl ImTransport for FeishuTransport {
     async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<Option<String>, SendError> {
         let _chat_id = Self::parse_chat_id(channel_id)?;
         let token = self.get_token().await?;
-        // Feishu uses its own emoji_type identifiers. Always use "OneSecond" as processing indicator.
-        let _ = emoji;
-        let emoji_type = "OneSecond";
+        // Feishu uses its own emoji_type identifiers — pass through directly (e.g. "OneSecond", "CheckMark").
+        let emoji_type = emoji;
         let body = serde_json::json!({ "reaction_type": { "emoji_type": emoji_type } });
         let url = format!("{}/im/v1/messages/{}/reactions", FEISHU_API_BASE, message_id);
         eprintln!("{} direction=add_reaction message_id={} emoji_type={} url={}",
@@ -269,6 +270,8 @@ impl ImTransport for FeishuTransport {
         let chat_id = Self::parse_chat_id(channel_id)?;
         let token = self.get_token().await?;
 
+        // Feishu card v1 format: config + header + elements array.
+        // Text block: tag=div with text.tag=lark_md. Buttons: tag=action with actions array.
         let buttons: Vec<serde_json::Value> = options.iter().map(|opt| {
             let btn_type = match opt.style {
                 ButtonStyle::Primary => "primary",
@@ -285,13 +288,23 @@ impl ImTransport for FeishuTransport {
 
         let card = serde_json::json!({
             "config": { "wide_screen_mode": true },
-            "header": { "title": { "tag": "plain_text", "content": "🤖 VibeAround" } },
+            "header": {
+                "title": { "tag": "plain_text", "content": "🤖 VibeAround" },
+                "template": "blue"
+            },
             "elements": [
-                { "tag": "div", "text": { "tag": "lark_md", "content": prompt } },
-                { "tag": "action", "actions": buttons }
+                {
+                    "tag": "div",
+                    "text": { "tag": "lark_md", "content": prompt }
+                },
+                {
+                    "tag": "action",
+                    "actions": buttons
+                }
             ]
         });
         let content = card.to_string();
+        eprintln!("{} direction=send_interactive card_content={}", prefix_channel("feishu"), &content[..content.len().min(800)]);
 
         let (url, body) = if let Some(reply_mid) = reply_to {
             let url = format!("{}/im/v1/messages/{}/reply", FEISHU_API_BASE, reply_mid);
@@ -308,6 +321,11 @@ impl ImTransport for FeishuTransport {
             .map_err(|e| SendError::Other(e.to_string()))?;
         let text_res = res.text().await.map_err(|e| SendError::Other(e.to_string()))?;
         let json: serde_json::Value = serde_json::from_str(&text_res).unwrap_or(serde_json::Value::Null);
+        let code = json.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        if code != 0 {
+            eprintln!("{} direction=send_interactive error=code={} body={}",
+                prefix_channel("feishu"), code, text_res);
+        }
         let message_id = json.pointer("/data/message_id").and_then(|v| v.as_str()).map(String::from);
         Ok(message_id)
     }

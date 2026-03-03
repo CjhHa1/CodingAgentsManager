@@ -46,6 +46,10 @@ pub struct ImChannelCapabilities {
     pub max_message_len: usize,
     /// Prefix for channel_id (e.g. "telegram", "feishu") for routing and logging.
     pub channel_id_prefix: &'static str,
+    /// Reaction to add when processing starts (platform-specific identifier).
+    pub processing_reaction: &'static str,
+    /// Reaction to add when an operation completes successfully.
+    pub done_reaction: &'static str,
 }
 
 /// Transport that can send and optionally edit messages. Implemented per IM channel.

@@ -566,4 +566,10 @@ where
     pub fn capabilities(&self) -> ImChannelCapabilities {
         self.transport.capabilities()
     }
+
+    /// Send a message directly (bypassing the queue) and return the message_id.
+    /// Used when the caller needs the message_id immediately (e.g. to add a reaction to it later).
+    pub async fn send_direct(&self, channel_id: &str, text: &str) -> Option<String> {
+        self.transport.send(channel_id, text).await.ok().flatten()
+    }
 }

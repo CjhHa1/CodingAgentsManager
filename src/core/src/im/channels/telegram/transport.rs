@@ -24,6 +24,10 @@ impl ImTransport for TelegramTransport {
             buffer_stream: true,
             max_message_len: TELEGRAM_MAX_MESSAGE_LEN,
             channel_id_prefix: "telegram",
+            // Telegram reactions must be from the allowed emoji list:
+            // https://core.telegram.org/bots/api#reactiontypeemoji
+            processing_reaction: "👀",
+            done_reaction: "🎉",
         }
     }
 

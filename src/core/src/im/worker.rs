@@ -58,9 +58,16 @@ pub async fn run_worker<T>(
         let channel_id = msg.channel_id.clone();
         busy_set.insert(channel_id.clone(), ());
 
+        // --- /help command ---
+        if msg.text.trim() == "/help" {
+            send_help(&channel_id, &outbound).await;
+            busy_set.remove(&channel_id);
+            continue;
+        }
+
         // --- /cli command: switch agent ---
         if let Some(kind) = parse_cli_command(&msg.text) {
-            switch_agent(&mut active_agent, kind, &working_dir, &channel_id, &outbound).await;
+            switch_agent(&mut active_agent, kind, &working_dir, &channel_id, &outbound, msg.user_message_id.as_deref()).await;
             busy_set.remove(&channel_id);
             continue;
         }
@@ -68,9 +75,8 @@ pub async fn run_worker<T>(
         // --- Ensure an agent is running (lazy start Claude on first message) ---
         if active_agent.is_none() {
             eprintln!("[VibeAround][im][worker] no active agent, starting default (claude)...");
-            switch_agent(&mut active_agent, AgentKind::Claude, &working_dir, &channel_id, &outbound).await;
+            switch_agent(&mut active_agent, AgentKind::Claude, &working_dir, &channel_id, &outbound, msg.user_message_id.as_deref()).await;
             if active_agent.is_none() {
-                // Failed to start — error already sent by switch_agent
                 busy_set.remove(&channel_id);
                 continue;
             }
@@ -93,38 +99,54 @@ fn parse_cli_command(text: &str) -> Option<AgentKind> {
 }
 
 /// Shut down the current agent (if any) and start a new one.
+/// Sends an immediate status message, then marks it done (reaction) when complete.
 async fn switch_agent<T>(
     active_agent: &mut Option<Box<dyn AgentBackend>>,
     kind: AgentKind,
     working_dir: &std::path::Path,
     channel_id: &str,
     outbound: &Arc<OutboundHub<T>>,
+    user_message_id: Option<&str>,
 ) where
     T: crate::im::transport::ImTransport + 'static,
 {
-    // Shut down existing
+    let caps = outbound.capabilities();
+
+    // Send an immediate status message so the user sees something right away.
+    // We call transport directly (bypassing the queue) to get back the message_id.
+    let status_msg = format!("⏳ Starting {} agent...", kind);
+    let status_message_id: Option<String> = outbound.send_direct(channel_id, &status_msg).await;
+
+    // Shut down existing agent
     if let Some(mut old) = active_agent.take() {
         old.shutdown().await;
     }
 
-    // Start new
+    // Start new agent
     let mut backend = agent::create_backend(kind);
-    match backend.start(working_dir).await {
+    let success = match backend.start(working_dir).await {
         Ok(()) => {
-            let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
-                channel_id.to_string(),
-                format!("[✓ {} agent started in workspace root]", kind),
-            )).await;
             *active_agent = Some(backend);
+            true
         }
         Err(e) => {
-            let _ = outbound.send(channel_id, OutboundMsg::StreamPart(
+            let _ = outbound.send(channel_id, OutboundMsg::Send(
                 channel_id.to_string(),
-                format!("[✗ Failed to start {} agent: {}]", kind, e),
+                format!("✗ Failed to start {} agent: {}", kind, e),
+            )).await;
+            false
+        }
+    };
+
+    // Mark the status message done via reaction (or fall back to user's message).
+    let reaction_target = status_message_id.as_deref().or(user_message_id);
+    if let Some(mid) = reaction_target {
+        if success {
+            let _ = outbound.send(channel_id, OutboundMsg::AddReaction(
+                channel_id.to_string(), mid.to_string(), caps.done_reaction.to_string(),
             )).await;
         }
     }
-    let _ = outbound.send(channel_id, OutboundMsg::StreamEnd(channel_id.to_string())).await;
 }
 
 /// Truncate tool output for display in IM (avoid flooding).
@@ -154,7 +176,7 @@ async fn run_with_agent<T>(
     // Add a reaction to indicate we're processing (if user_message_id available)
     let reaction_info: Option<(String, Option<String>)> = if let Some(ref user_mid) = msg.user_message_id {
         let _ = outbound.send(channel_id, OutboundMsg::AddReaction(
-            channel_id.to_string(), user_mid.clone(), "👀".to_string(),
+            channel_id.to_string(), user_mid.clone(), caps.processing_reaction.to_string(),
         )).await;
         // Set reply_to so buffer flush will quote the user's message
         outbound.set_reply_to(channel_id, user_mid.clone()).await;
@@ -318,4 +340,40 @@ async fn remove_processing_reaction<T>(
             channel_id.to_string(), user_mid.clone(), rid.to_string(),
         )).await;
     }
+}
+
+/// Send a /help interactive card with all supported commands as clickable buttons.
+async fn send_help<T>(
+    channel_id: &str,
+    outbound: &Arc<OutboundHub<T>>,
+) where
+    T: crate::im::transport::ImTransport + 'static,
+{
+    use crate::im::transport::{ButtonStyle, InteractiveOption};
+
+    let prompt = "**VibeAround Commands**\n\nClick a button or type the command directly:";
+    let options = vec![
+        InteractiveOption {
+            label: "🤖 Switch to Claude".into(),
+            value: "/cli claude".into(),
+            style: ButtonStyle::Primary,
+        },
+        InteractiveOption {
+            label: "✨ Switch to Gemini".into(),
+            value: "/cli gemini".into(),
+            style: ButtonStyle::Default,
+        },
+        InteractiveOption {
+            label: "❓ Help".into(),
+            value: "/help".into(),
+            style: ButtonStyle::Default,
+        },
+    ];
+
+    let _ = outbound.send(channel_id, OutboundMsg::SendInteractive {
+        channel_id: channel_id.to_string(),
+        prompt: prompt.to_string(),
+        options,
+        reply_to: None,
+    }).await;
 }

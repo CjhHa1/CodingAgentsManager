@@ -203,3 +203,55 @@ pub async fn run_feishu_bot() -> Option<FeishuWebhookState> {
     eprintln!("{} event=bot_ready webhook=/api/im/feishu/event", prefix_channel("feishu"));
     Some(FeishuWebhookState { inbound_tx, outbound, busy_set, transport })
 }
+
+/// Handle Feishu card callback (button clicks). Returns (status_code, body_json_string).
+/// Feishu requires a response within 3 seconds.
+/// The callback data contains action.value (our button value) and context.open_chat_id.
+pub async fn handle_card_callback(
+    body: &str,
+    state: Option<&FeishuWebhookState>,
+) -> (u16, String) {
+    let root: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return (200, "{}".to_string()),
+    };
+
+    let Some(st) = state else { return (200, "{}".to_string()); };
+
+    // Extract action value and chat context
+    let action_value = root.pointer("/action/value");
+    let chat_id = root.pointer("/context/open_chat_id").and_then(|v| v.as_str());
+
+    let Some(chat_id) = chat_id else { return (200, "{}".to_string()); };
+
+    // The action value contains {"action": "/cli claude"} or similar
+    let command = action_value
+        .and_then(|v| v.get("action"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if command.is_empty() {
+        return (200, "{}".to_string());
+    }
+
+    let channel_id = format!("feishu:{}", chat_id);
+    eprintln!("[VibeAround][im][feishu] card_callback chat_id={} command={}", chat_id, command);
+
+    if st.busy_set.contains_key(&channel_id) {
+        let _ = st.outbound.send(&channel_id, OutboundMsg::Send(
+            channel_id.clone(), "Please wait for the current task to finish.".to_string())).await;
+        return (200, "{}".to_string());
+    }
+
+    let _ = st.inbound_tx.send(InboundMessage {
+        channel_id,
+        text: command,
+        attachments: vec![],
+        parent_id: None,
+        user_message_id: None,
+    }).await;
+
+    (200, "{}".to_string())
+}
