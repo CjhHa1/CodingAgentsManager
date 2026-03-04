@@ -46,6 +46,10 @@ pub struct Config {
     pub ngrok_auth_token: Option<String>,
     /// Reserved/static domain (e.g. myapp.ngrok.io). If set, tunnel uses this instead of a random URL.
     pub ngrok_domain: Option<String>,
+    /// Cloudflare Tunnel token (from `cloudflared tunnel run --token <TOKEN>`).
+    pub cloudflare_tunnel_token: Option<String>,
+    /// Cloudflare Tunnel public hostname (e.g. vibe.yourdomain.com). Configured in CF Dashboard.
+    pub cloudflare_hostname: Option<String>,
     pub telegram_bot_token: Option<String>,
     pub feishu_app_id: Option<String>,
     pub feishu_app_secret: Option<String>,
@@ -96,6 +100,18 @@ fn load_settings_from(path: &std::path::Path) -> Config {
         .filter(|s| !s.is_empty());
     let ngrok_domain = tunnel_ngrok
         .and_then(|n| n.get("domain"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let tunnel_cloudflare = root.get("tunnel").and_then(|t| t.get("cloudflare"));
+    let cloudflare_tunnel_token = tunnel_cloudflare
+        .and_then(|c| c.get("tunnel_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let cloudflare_hostname = tunnel_cloudflare
+        .and_then(|c| c.get("hostname"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -155,6 +171,8 @@ fn load_settings_from(path: &std::path::Path) -> Config {
         tunnel_provider,
         ngrok_auth_token,
         ngrok_domain,
+        cloudflare_tunnel_token,
+        cloudflare_hostname,
         telegram_bot_token,
         feishu_app_id,
         feishu_app_secret,
@@ -174,6 +192,7 @@ pub fn preview_base_url() -> Option<String> {
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| cfg.cloudflare_hostname.as_ref().map(|h| format!("https://{}", h.trim())))
         .or_else(|| cfg.ngrok_domain.as_ref().map(|d| format!("https://{}", d.trim())))
 }
 
@@ -206,6 +225,8 @@ impl Default for Config {
             tunnel_provider: TunnelProvider::default(),
             ngrok_auth_token: None,
             ngrok_domain: None,
+            cloudflare_tunnel_token: None,
+            cloudflare_hostname: None,
             telegram_bot_token: None,
             feishu_app_id: None,
             feishu_app_secret: None,
