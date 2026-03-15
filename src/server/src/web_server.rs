@@ -3,7 +3,7 @@
 //! and static preview (/preview/:project_id, /raw/:project_id/*). /ws?session_id=xxx attaches to a session.
 
 use axum::{
-    extract::{Path, Query, State, ws::{Message, WebSocket, WebSocketUpgrade}},
+    extract::{Path, Query, State, ws::{Message, WebSocket, WebSocketUpgrade}, Multipart},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
@@ -165,6 +165,7 @@ pub async fn run_web_server(
         .route("/api/tmux/sessions", get(list_tmux_sessions_handler))
         .route("/api/agents", get(list_agents_handler))
         .route("/api/projects", get(list_projects_handler))
+        .route("/api/stt", post(stt_handler))
         .route("/api/im/feishu/event", post(feishu_webhook_handler))
         .route("/api/im/feishu/card", post(feishu_card_callback_handler))
         .route("/preview/{project_id}", get(preview_page_handler))
@@ -773,6 +774,99 @@ async fn handle_chat_socket(socket: WebSocket, working_dir: PathBuf, _db: Arc<st
     // Clean up agent on disconnect
     if let Some(mut agent) = active_agent.take() {
         agent.shutdown().await;
+    }
+}
+
+/// POST /api/stt — speech-to-text via OpenAI Whisper API.
+/// Accepts multipart/form-data with an "audio" field containing the audio file.
+/// Returns {"text": "..."} or {"error": "..."}.
+async fn stt_handler(mut multipart: Multipart) -> Response {
+    let api_key = match config::ensure_loaded().stt_openai_api_key.as_deref() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "STT not configured: set stt.openai_api_key in settings.json"})),
+            ).into_response();
+        }
+    };
+
+    // Extract audio bytes from multipart
+    let mut audio_bytes: Option<Vec<u8>> = None;
+    let mut filename = "audio.webm".to_string();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("audio") {
+            if let Some(fname) = field.file_name() {
+                filename = fname.to_string();
+            }
+            match field.bytes().await {
+                Ok(b) => { audio_bytes = Some(b.to_vec()); }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to read audio: {}", e)})),
+                    ).into_response();
+                }
+            }
+            break;
+        }
+    }
+
+    let audio_bytes = match audio_bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing audio field"})),
+            ).into_response();
+        }
+    };
+
+    // Determine MIME type from filename extension
+    let mime = mime_guess::from_path(&filename).first_raw().unwrap_or("audio/webm");
+
+    // Call OpenAI Whisper API
+    let client = reqwest::Client::new();
+    let part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name(filename)
+        .mime_str(mime)
+        .unwrap_or_else(|_| reqwest::multipart::Part::bytes(vec![]));
+    let form = reqwest::multipart::Form::new()
+        .text("model", "whisper-1")
+        .part("file", part);
+
+    let resp = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .bearer_auth(&api_key)
+        .multipart(form)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            match r.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    Json(serde_json::json!({"text": text})).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to parse Whisper response: {}", e)})),
+                ).into_response(),
+            }
+        }
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Whisper API error {}: {}", status, body)})),
+            ).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Failed to reach Whisper API: {}", e)})),
+        ).into_response(),
     }
 }
 

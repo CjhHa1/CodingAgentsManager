@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { ChevronDown, Send, Square } from "lucide-react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { ChevronDown, Send, Square, Mic, MicOff } from "lucide-react";
 import type { ToolType } from "@/lib/terminal-types";
 import { getToolTheme } from "@/lib/terminal-types";
 import { useTheme } from "@/lib/theme";
@@ -50,6 +50,10 @@ export function ChatInput({
   className,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -64,6 +68,49 @@ export function ChatInput({
       if (!disabled && value.trim()) onSubmit();
     }
   };
+
+  const startRecording = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        setIsTranscribing(true);
+        try {
+          const form = new FormData();
+          form.append("audio", blob, "audio.webm");
+          const res = await fetch("/api/stt", { method: "POST", body: form });
+          const json = await res.json();
+          if (json.text) onChange(json.text);
+        } catch {
+          // silently ignore transcription errors
+        } finally {
+          setIsTranscribing(false);
+        }
+      };
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+    } catch {
+      // microphone access denied or unavailable
+    }
+  }, [onChange]);
+
+  const stopRecording = useCallback(() => {
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+    setIsRecording(false);
+  }, []);
+
+  const handleMicClick = useCallback(() => {
+    if (isRecording) stopRecording();
+    else startRecording();
+  }, [isRecording, startRecording, stopRecording]);
 
   const canSend = !disabled && !!value.trim();
   const showStop = isStreaming && onStop;
@@ -86,8 +133,8 @@ export function ChatInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={placeholder}
-          disabled={disabled}
+          placeholder={isTranscribing ? "Transcribing…" : placeholder}
+          disabled={disabled || isTranscribing}
           rows={1}
           className="min-h-[2.5rem] max-h-32 resize-none overflow-y-auto border-0 bg-transparent px-3 py-2 text-base sm:text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 transition-[height] duration-200 ease-out"
           style={{ height: "2.5rem" }}
@@ -127,20 +174,34 @@ export function ChatInput({
               <span className="truncate" style={{ color: accentColor }}>{targetLabel}</span>
             </span>
           )}
-          <Button
-            type="button"
-            size="icon"
-            onClick={showStop ? onStop : onSubmit}
-            disabled={!showStop && !canSend}
-            className="h-8 w-8 shrink-0 rounded-full"
-            aria-label={showStop ? "Stop" : "Send"}
-          >
-            {showStop ? (
-              <Square className="h-4 w-4" />
-            ) : (
-              <Send className="h-4 w-4" />
-            )}
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              onClick={handleMicClick}
+              disabled={disabled || isStreaming || isTranscribing}
+              className={`h-8 w-8 shrink-0 rounded-full ${isRecording ? "text-red-500 hover:text-red-600" : ""}`}
+              aria-label={isRecording ? "Stop recording" : "Start voice input"}
+              title={isRecording ? "Stop recording" : "Voice input"}
+            >
+              {isRecording ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+            </Button>
+            <Button
+              type="button"
+              size="icon"
+              onClick={showStop ? onStop : onSubmit}
+              disabled={!showStop && !canSend}
+              className="h-8 w-8 shrink-0 rounded-full"
+              aria-label={showStop ? "Stop" : "Send"}
+            >
+              {showStop ? (
+                <Square className="h-4 w-4" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
         </div>
       </div>
     </div>

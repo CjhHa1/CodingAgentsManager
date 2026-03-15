@@ -8,6 +8,30 @@ use std::sync::OnceLock;
 
 use crate::tunnels::TunnelProvider;
 
+/// Agent execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    /// Fully autonomous: Claude runs with --dangerously-skip-permissions, ACP auto-accepts all.
+    Auto,
+    /// Interactive: Claude prompts for permissions (ACP still auto-accepts for non-Claude agents).
+    Interactive,
+}
+
+impl Default for AgentMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl AgentMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "interactive" => Self::Interactive,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Root directory for config: settings.json lives here (workspace src/ when common is in src/core).
 fn config_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -68,6 +92,10 @@ pub struct Config {
     pub default_agent: String,
     /// Which agents are enabled (shown in UI / IM). Empty = all agents enabled.
     pub enabled_agents: Vec<crate::agent::AgentKind>,
+    /// Agent execution mode. "auto" (default) = fully autonomous; "interactive" = Claude prompts for permissions.
+    pub agent_mode: AgentMode,
+    /// OpenAI API key for speech-to-text (Whisper). Required for /api/stt endpoint.
+    pub stt_openai_api_key: Option<String>,
 }
 
 /// Ensure config is loaded (idempotent). Loads settings.json on first call; returns the same instance afterwards.
@@ -181,6 +209,19 @@ fn load_settings_from(path: &std::path::Path) -> Config {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| crate::agent::AgentKind::all().to_vec());
 
+    let agent_mode = root
+        .get("agent_mode")
+        .and_then(|v| v.as_str())
+        .map(AgentMode::from_str)
+        .unwrap_or_default();
+
+    let stt_openai_api_key = root
+        .get("stt")
+        .and_then(|s| s.get("openai_api_key"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
     Config {
         tunnel_provider,
         ngrok_auth_token,
@@ -197,6 +238,8 @@ fn load_settings_from(path: &std::path::Path) -> Config {
         telegram_verbose,
         default_agent,
         enabled_agents,
+        agent_mode,
+        stt_openai_api_key,
     }
 }
 
@@ -252,6 +295,8 @@ impl Default for Config {
             telegram_verbose: ImVerboseConfig::default(),
             default_agent: "claude".to_string(),
             enabled_agents: crate::agent::AgentKind::all().to_vec(),
+            agent_mode: AgentMode::default(),
+            stt_openai_api_key: None,
         }
     }
 }
