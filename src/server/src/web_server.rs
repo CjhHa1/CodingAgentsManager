@@ -511,8 +511,19 @@ async fn delete_session_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ws_chat_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    let working_dir = state.working_dir.clone();
+/// Query params for /ws/chat. cwd = optional working directory override for this session.
+#[derive(serde::Deserialize)]
+struct WsChatQuery {
+    cwd: Option<String>,
+}
+
+async fn ws_chat_handler(State(state): State<AppState>, Query(query): Query<WsChatQuery>, ws: WebSocketUpgrade) -> Response {
+    let working_dir = query.cwd
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| state.working_dir.clone());
     let db = state.db.clone();
     ws.on_upgrade(move |socket| handle_chat_socket(socket, working_dir, db))
 }
@@ -612,6 +623,7 @@ async fn handle_chat_socket(socket: WebSocket, working_dir: PathBuf, _db: Arc<st
             "type": "config",
             "agents": agents,
             "default_agent": cfg.default_agent,
+            "cwd": working_dir.to_string_lossy(),
         });
         let _ = ws_tx.send(Message::Text(config_msg.to_string().into())).await;
         cfg.default_agent.clone()

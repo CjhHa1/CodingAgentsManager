@@ -50,12 +50,17 @@ export function ChatView() {
   const [currentAgent, setCurrentAgent] = useState<string>("claude");
   const wsRef = useRef<WebSocket | null>(null);
 
+  // Working directory
+  const [cwd, setCwd] = useState<string>("");
+  const [activeCwd, setActiveCwd] = useState<string>("");
+
   const toolType = agentIdToToolType(currentAgent);
   const agentLabel = capitalize(currentAgent);
 
   // Connect on mount, close on unmount
   useEffect(() => {
-    const ws = new WebSocket(getWebSocketUrl("/ws/chat"));
+    const url = getWebSocketUrl("/ws/chat") + (cwd.trim() ? `?cwd=${encodeURIComponent(cwd.trim())}` : "");
+    const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => setConnected(true);
@@ -77,11 +82,14 @@ export function ChatView() {
         return;
       }
 
-      // {"type":"config","agents":[...],"default_agent":"claude"} — agent config push on connect
+      // {"type":"config","agents":[...],"default_agent":"claude","cwd":"..."} — agent config push on connect
       if (j.type === "config" && Array.isArray(j.agents)) {
         setAgents(j.agents as AgentInfo[]);
         if (typeof j.default_agent === "string") {
           setCurrentAgent(j.default_agent as string);
+        }
+        if (typeof j.cwd === "string") {
+          setActiveCwd(j.cwd);
         }
         return;
       }
@@ -165,7 +173,7 @@ export function ChatView() {
       ws.close();
       wsRef.current = null;
     };
-  }, []);
+  }, [cwd]);
 
   const sendMessage = useCallback(() => {
     const text = input.trim();
@@ -233,6 +241,19 @@ export function ChatView() {
         <ConversationScrollButton />
       </Conversation>
 
+      <div className="shrink-0 border-t border-border/40 px-4 py-2 flex items-center gap-2">
+        <span className="text-[10px] font-mono text-muted-foreground/50 shrink-0">cwd</span>
+        <input
+          type="text"
+          value={connected ? activeCwd : cwd}
+          onChange={(e) => !connected && setCwd(e.target.value)}
+          readOnly={connected}
+          placeholder="Default working directory"
+          title={connected ? "Disconnect to change working directory" : "Working directory for agent (absolute path)"}
+          className="flex-1 min-w-0 bg-transparent text-[11px] font-mono text-foreground/70 placeholder:text-muted-foreground/30 outline-none border-0 truncate cursor-default data-[editable=true]:cursor-text"
+          data-editable={!connected}
+        />
+      </div>
       <ChatInput
         value={input}
         onChange={setInput}
