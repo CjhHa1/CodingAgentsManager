@@ -53,6 +53,7 @@ export function ChatView() {
   // Working directory
   const [cwd, setCwd] = useState<string>("");
   const [activeCwd, setActiveCwd] = useState<string>("");
+  const [sttAvailable, setSttAvailable] = useState<boolean>(false);
 
   const toolType = agentIdToToolType(currentAgent);
   const agentLabel = capitalize(currentAgent);
@@ -69,6 +70,13 @@ export function ChatView() {
       setStreaming(false);
     };
     ws.onerror = () => setConnected(false);
+
+    // Keepalive: send ping every 25s to prevent proxy idle timeout
+    const pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "ping" }));
+      }
+    }, 25_000);
 
     ws.onmessage = (event) => {
       if (typeof event.data !== "string") return;
@@ -90,6 +98,9 @@ export function ChatView() {
         }
         if (typeof j.cwd === "string") {
           setActiveCwd(j.cwd);
+        }
+        if (typeof j.stt_available === "boolean") {
+          setSttAvailable(j.stt_available);
         }
         return;
       }
@@ -170,6 +181,7 @@ export function ChatView() {
     }
 
     return () => {
+      clearInterval(pingInterval);
       ws.close();
       wsRef.current = null;
     };
@@ -249,10 +261,26 @@ export function ChatView() {
           onChange={(e) => !connected && setCwd(e.target.value)}
           readOnly={connected}
           placeholder="Default working directory"
-          title={connected ? "Disconnect to change working directory" : "Working directory for agent (absolute path)"}
-          className="flex-1 min-w-0 bg-transparent text-[11px] font-mono text-foreground/70 placeholder:text-muted-foreground/30 outline-none border-0 truncate cursor-default data-[editable=true]:cursor-text"
+          title={connected ? "Click disconnect to change working directory" : "Working directory for agent (absolute path)"}
+          className="flex-1 min-w-0 bg-transparent text-[11px] font-mono text-foreground/70 placeholder:text-muted-foreground/30 outline-none border-0 truncate data-[editable=true]:cursor-text data-[editable=false]:cursor-default"
           data-editable={!connected}
         />
+        <button
+          type="button"
+          onClick={() => {
+            if (connected) {
+              wsRef.current?.close();
+            }
+          }}
+          title={connected ? "Disconnect to change working directory" : ""}
+          className={`shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded transition-colors ${
+            connected
+              ? "text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+              : "text-muted-foreground/20 cursor-default pointer-events-none"
+          }`}
+        >
+          {connected ? "disconnect" : "disconnected"}
+        </button>
       </div>
       <ChatInput
         value={input}
@@ -265,6 +293,7 @@ export function ChatView() {
         targetTool={toolType}
         agents={agents}
         onAgentChange={handleAgentChange}
+        sttAvailable={sttAvailable}
       />
     </div>
   );

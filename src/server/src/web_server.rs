@@ -72,6 +72,9 @@ struct CreateSessionBody {
     /// If "dark" or "light", sets COLORFGBG in PTY env as fallback for programs that don't query OSC 10/11.
     #[serde(default)]
     theme: Option<String>,
+    /// Permission mode for Claude/Codex: "acceptEdits" | "bypassPermissions".
+    #[serde(default)]
+    permission_mode: Option<String>,
 }
 
 /// Session list item (GET /api/sessions).
@@ -126,7 +129,54 @@ async fn spa_fallback(dist_path: PathBuf) -> Response {
     }
 }
 
-/// Runs the Axum server (static files + WebSocket + session API). Binds to 127.0.0.1 (localhost only).
+/// Query params for GET /api/fs/dirs.
+#[derive(serde::Deserialize)]
+struct FsDirsQuery {
+    path: Option<String>,
+}
+
+/// GET /api/fs/dirs?path=<dir> — list immediate subdirectories of the given path.
+/// If path is "~" or omitted, defaults to $HOME.
+async fn fs_dirs_handler(Query(q): Query<FsDirsQuery>) -> Json<serde_json::Value> {
+    let base: std::path::PathBuf = match q.path.as_deref() {
+        None | Some("~") => std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/")),
+        Some(p) if p.starts_with("~/") => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            std::path::PathBuf::from(home).join(&p[2..])
+        }
+        Some(p) => std::path::PathBuf::from(p),
+    };
+
+    let mut dirs: Vec<String> = std::fs::read_dir(&base)
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| {
+                let e = e.ok()?;
+                if e.file_type().ok()?.is_dir() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    // Skip hidden dirs
+                    if name.starts_with('.') {
+                        return None;
+                    }
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+
+    Json(serde_json::json!({
+        "path": base.to_string_lossy(),
+        "dirs": dirs,
+    }))
+}
+
+/// Runs the Axum server (static files + WebSocket + session API). Binds to 0.0.0.0 (all interfaces).
 /// If feishu_state is Some, POST /api/im/feishu/event handles Feishu webhook (url_verification + events).
 /// Call from desktop via tauri::async_runtime::spawn, or run standalone via the server binary.
 pub async fn run_web_server(
@@ -138,9 +188,9 @@ pub async fn run_web_server(
     let web_dist = dist_path
         .canonicalize()
         .map_err(|e| format!("Failed to resolve web dist path: {}", e))?;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!(
-        "[VibeAround] Web dashboard: http://127.0.0.1:{}, serving from {:?}",
+        "[VibeAround] Web dashboard: http://0.0.0.0:{}, serving from {:?}",
         port, web_dist
     );
 
@@ -165,6 +215,7 @@ pub async fn run_web_server(
         .route("/api/tmux/sessions", get(list_tmux_sessions_handler))
         .route("/api/agents", get(list_agents_handler))
         .route("/api/projects", get(list_projects_handler))
+        .route("/api/fs/dirs", get(fs_dirs_handler))
         .route("/api/stt", post(stt_handler))
         .route("/api/im/feishu/event", post(feishu_webhook_handler))
         .route("/api/im/feishu/card", post(feishu_card_callback_handler))
@@ -178,7 +229,7 @@ pub async fn run_web_server(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("[VibeAround] Web server listening on http://127.0.0.1:{}", port);
+    println!("[VibeAround] Web server listening on http://0.0.0.0:{}", port);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -259,10 +310,14 @@ async fn create_session_handler(
         }
         (Some(p.clone()), Some(p.to_string_lossy().into_owned()))
     } else {
-        (None, body.project_path.clone())
+        let cwd = body.project_path.as_deref()
+            .map(std::path::Path::new)
+            .filter(|p| p.is_absolute() && p.is_dir())
+            .map(|p| p.to_path_buf());
+        (cwd, body.project_path.clone())
     };
     let (bridge, mut pty_rx, resize_tx, mut state_rx) =
-        common::pty::spawn_pty(tool, cwd, body.tmux_session.clone(), body.theme.clone()).map_err(|e| {
+        common::pty::spawn_pty(tool, cwd, body.tmux_session.clone(), body.theme.clone(), body.permission_mode.clone()).map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start PTY: {}", e))
         })?;
     let created_at = unix_now_secs();
@@ -624,6 +679,7 @@ async fn handle_chat_socket(socket: WebSocket, working_dir: PathBuf, _db: Arc<st
             "agents": agents,
             "default_agent": cfg.default_agent,
             "cwd": working_dir.to_string_lossy(),
+            "stt_available": cfg.stt_openai_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
         });
         let _ = ws_tx.send(Message::Text(config_msg.to_string().into())).await;
         cfg.default_agent.clone()
@@ -652,6 +708,13 @@ async fn handle_chat_socket(socket: WebSocket, working_dir: PathBuf, _db: Arc<st
         let prompt = user_msg.trim().to_string();
         if prompt.is_empty() {
             continue;
+        }
+
+        // Skip keepalive pings
+        if let Ok(j) = serde_json::from_str::<serde_json::Value>(&prompt) {
+            if j.get("type").and_then(|v| v.as_str()) == Some("ping") {
+                continue;
+            }
         }
 
         // Handle /cli_<agent> command — switch agent

@@ -22,6 +22,8 @@ export interface CreateSessionBody {
   tmux_session?: string;
   /** "dark" | "light" — sets COLORFGBG in PTY env as fallback for non-OSC programs. */
   theme?: string;
+  /** "acceptEdits" | "bypassPermissions" — permission mode for Claude/Codex. */
+  permission_mode?: string;
 }
 
 export interface CreateSessionResponse {

@@ -26,7 +26,7 @@ fn shell_command() -> CommandBuilder {
 /// Exec string for each tool when wrapping with cd (bash -c "cd ... && exec ...").
 /// Claude code runs with acceptEdits so file writes are auto-approved in headless/PTY.
 /// For tmux: if session exists, attach (with -d when tmux_detach_others); otherwise create new session.
-fn tool_exec_argv(tool: PtyTool, tmux_session: Option<&str>) -> String {
+fn tool_exec_argv(tool: PtyTool, tmux_session: Option<&str>, mode: Option<&str>) -> String {
     if let Some(name) = tmux_session {
         let escaped = name.replace('\'', "'\"'\"'");
         let detach = crate::config::ensure_loaded().tmux_detach_others;
@@ -44,9 +44,15 @@ fn tool_exec_argv(tool: PtyTool, tmux_session: Option<&str>) -> String {
     }
     match tool {
         PtyTool::Generic => "bash -l".to_string(),
-        PtyTool::Claude => "claude code --permission-mode acceptEdits".to_string(),
+        PtyTool::Claude => match mode {
+            Some("bypassPermissions") => "claude code --dangerously-skip-permissions".to_string(),
+            _ => "claude code --permission-mode acceptEdits".to_string(),
+        },
         PtyTool::Gemini => "gemini".to_string(),
-        PtyTool::Codex => "codex".to_string(),
+        PtyTool::Codex => match mode {
+            Some("bypassPermissions") => "codex --approval-policy never".to_string(),
+            _ => "codex".to_string(),
+        },
         PtyTool::OpenCode => "opencode".to_string(),
     }
 }
@@ -87,13 +93,14 @@ fn command_for_tool(
     cwd: Option<&Path>,
     tmux_session: Option<&str>,
     theme: Option<&str>,
+    mode: Option<&str>,
 ) -> CommandBuilder {
     if let Some(dir) = cwd {
         #[cfg(unix)]
         {
             let path = dir.to_string_lossy();
             let escaped = path.replace('\'', "'\"'\"'");
-            let exec = tool_exec_argv(tool, tmux_session);
+            let exec = tool_exec_argv(tool, tmux_session, mode);
             let line = format!("cd '{}' && exec {}", escaped, exec);
             return bash_wrapper(&line, theme);
         }
@@ -102,7 +109,7 @@ fn command_for_tool(
     }
 
     if tmux_session.is_some() {
-        let exec = tool_exec_argv(tool, tmux_session);
+        let exec = tool_exec_argv(tool, tmux_session, mode);
         return bash_wrapper(&exec, theme);
     }
 
@@ -221,11 +228,13 @@ impl OscColorResponder {
 
 /// Spawn a process in a PTY. Returns bridge, PTY stdout receiver, resize sender, and state receiver.
 /// `theme`: "dark"/"light" — sets COLORFGBG env hint for programs that don't query OSC 10/11.
+/// `mode`: "acceptEdits" | "bypassPermissions" — permission mode for Claude/Codex.
 pub fn spawn_pty(
     tool: PtyTool,
     cwd: Option<std::path::PathBuf>,
     tmux_session: Option<String>,
     theme: Option<String>,
+    mode: Option<String>,
 ) -> Result<(PtyBridge, mpsc::Receiver<Vec<u8>>, ResizeSender, mpsc::Receiver<PtyRunState>), Box<dyn std::error::Error + Send + Sync>> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -240,6 +249,7 @@ pub fn spawn_pty(
         cwd.as_deref(),
         tmux_session.as_deref(),
         theme.as_deref(),
+        mode.as_deref(),
     );
     let child = pair.slave.spawn_command(cmd)?;
 

@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ThemeContext, getResolvedTheme, toggleTheme as applyThemeToggle, type Theme } from "@/lib/theme";
+import { DirInput } from "@/components/ui/DirInput";
 
 const DEFAULT_GROUP_ID = "default";
 
@@ -132,9 +133,26 @@ function App() {
     }
   }, [groups]);
 
-  const handleAddCli = useCallback(async (tool: ToolType) => {
+  // State for the "pick working dir" dialog before creating a CLI session.
+  const [pendingTool, setPendingTool] = useState<ToolType | null>(null);
+  const [pendingCwd, setPendingCwd] = useState("");
+  const [pendingMode, setPendingMode] = useState<"acceptEdits" | "bypassPermissions">("acceptEdits");
+
+  const handleAddCli = useCallback((tool: ToolType) => {
+    setPendingTool(tool);
+    setPendingCwd("");
+    setPendingMode("acceptEdits");
+  }, []);
+
+  const confirmAddCli = useCallback(async () => {
+    if (!pendingTool) return;
+    const tool = pendingTool;
+    const cwd = pendingCwd.trim();
+    const mode = pendingMode;
+    setPendingTool(null);
+    setPendingCwd("");
     try {
-      const res = await createSession({ tool, theme });
+      const res = await createSession({ tool, theme, project_path: cwd || undefined, permission_mode: mode });
       const session = sessionListItemToSession({
         session_id: res.session_id,
         tool: res.tool,
@@ -153,7 +171,7 @@ function App() {
     } catch (e) {
       console.error("[VibeAround] createSession:", e);
     }
-  }, [theme]);
+  }, [pendingTool, pendingCwd, pendingMode, theme]);
 
   // tmux: available flag + session list. Pre-fetch on mount so the dropdown has data immediately.
   const [tmuxAvailable, setTmuxAvailable] = useState<boolean | null>(null);
@@ -246,6 +264,60 @@ function App() {
 
   return (
     <ThemeContext.Provider value={theme}>
+    {pendingTool && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setPendingTool(null)}>
+        <div
+          className="bg-background border border-border rounded-lg p-4 w-[320px] shadow-xl flex flex-col gap-3"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <p className="text-xs font-mono text-foreground">
+            New <span className="text-primary">{sessionToName(pendingTool)}</span> session
+          </p>
+          <DirInput
+            value={pendingCwd}
+            onChange={setPendingCwd}
+            placeholder="Working directory (or leave empty)"
+            onConfirm={confirmAddCli}
+            onCancel={() => setPendingTool(null)}
+          />
+          {(pendingTool === "claude" || pendingTool === "codex") && (
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] font-mono text-muted-foreground/60 mr-1">mode:</span>
+              <button
+                type="button"
+                onClick={() => setPendingMode("acceptEdits")}
+                className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                  pendingMode === "acceptEdits"
+                    ? "border-primary/60 bg-primary/10 text-primary"
+                    : "border-border/40 text-muted-foreground/50 hover:text-foreground"
+                }`}
+              >
+                acceptEdits
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingMode("bypassPermissions")}
+                className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                  pendingMode === "bypassPermissions"
+                    ? "border-primary/60 bg-primary/10 text-primary"
+                    : "border-border/40 text-muted-foreground/50 hover:text-foreground"
+                }`}
+              >
+                bypassPermissions
+              </button>
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" size="sm" className="text-xs font-mono" onClick={() => setPendingTool(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" className="text-xs font-mono" onClick={confirmAddCli}>
+              Start
+            </Button>
+          </div>
+        </div>
+      </div>
+    )}
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
       {/* Header: VibeAround + view toggle. No tab bar here. */}
       <header className="flex items-center justify-between px-3 py-1.5 shrink-0 bg-muted/50 dark:bg-background border-b border-border">

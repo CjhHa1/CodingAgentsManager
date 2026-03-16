@@ -32,6 +32,8 @@ export interface ChatInputProps {
   agents?: AgentInfo[];
   /** Called when user picks a different agent from the dropdown. */
   onAgentChange?: (agentId: string) => void;
+  /** Whether STT (voice input) is configured on the server. */
+  sttAvailable?: boolean;
   className?: string;
 }
 
@@ -47,6 +49,7 @@ export function ChatInput({
   targetTool = "claude",
   agents,
   onAgentChange,
+  sttAvailable = false,
   className,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -54,6 +57,7 @@ export function ChatInput({
   const chunksRef = useRef<Blob[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [sttError, setSttError] = useState<string | null>(null);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -65,8 +69,13 @@ export function ChatInput({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (!disabled && value.trim()) onSubmit();
+      if (!disabled && value.trim()) handleSubmit();
     }
+  };
+
+  const handleSubmit = () => {
+    onSubmit();
+    setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
   const startRecording = useCallback(async () => {
@@ -81,14 +90,16 @@ export function ChatInput({
         stream.getTracks().forEach((t) => t.stop());
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         setIsTranscribing(true);
+        setSttError(null);
         try {
           const form = new FormData();
           form.append("audio", blob, "audio.webm");
           const res = await fetch("/api/stt", { method: "POST", body: form });
           const json = await res.json();
           if (json.text) onChange(json.text);
+          else if (json.error) setSttError(json.error);
         } catch {
-          // silently ignore transcription errors
+          setSttError("Transcription failed");
         } finally {
           setIsTranscribing(false);
         }
@@ -124,6 +135,9 @@ export function ChatInput({
       data-slot="chat-input"
       className={`bg-background p-4 border-t border-border ${className ?? ""}`}
     >
+      {sttError && (
+        <p className="mb-2 text-xs text-destructive font-mono">{sttError}</p>
+      )}
       <div
         role="group"
         className="flex min-h-[2.5rem] flex-col rounded-lg border border-border bg-muted/30 transition-[box-shadow,border-color] focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/30"
@@ -175,22 +189,24 @@ export function ChatInput({
             </span>
           )}
           <div className="flex items-center gap-1">
+            {sttAvailable && (
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                onClick={handleMicClick}
+                disabled={disabled || isStreaming || isTranscribing}
+                className={`h-8 w-8 shrink-0 rounded-full ${isRecording ? "text-red-500 hover:text-red-600" : ""}`}
+                aria-label={isRecording ? "Stop recording" : "Start voice input"}
+                title={isRecording ? "Stop recording" : "Voice input"}
+              >
+                {isRecording ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+              </Button>
+            )}
             <Button
               type="button"
               size="icon"
-              variant="ghost"
-              onClick={handleMicClick}
-              disabled={disabled || isStreaming || isTranscribing}
-              className={`h-8 w-8 shrink-0 rounded-full ${isRecording ? "text-red-500 hover:text-red-600" : ""}`}
-              aria-label={isRecording ? "Stop recording" : "Start voice input"}
-              title={isRecording ? "Stop recording" : "Voice input"}
-            >
-              {isRecording ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-            </Button>
-            <Button
-              type="button"
-              size="icon"
-              onClick={showStop ? onStop : onSubmit}
+              onClick={showStop ? onStop : handleSubmit}
               disabled={!showStop && !canSend}
               className="h-8 w-8 shrink-0 rounded-full"
               aria-label={showStop ? "Stop" : "Send"}
