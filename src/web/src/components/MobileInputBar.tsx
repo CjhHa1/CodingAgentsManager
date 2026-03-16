@@ -185,19 +185,20 @@ export function MobileInputBar({ sendInput }: MobileInputBarProps) {
           <button type="button" className={`${B} flex-1 text-[16px]`} style={S} onPointerDown={fire("\x1b[A")}>↑</button>
           <button type="button" className={`${B} flex-1 text-[16px]`} style={S} onPointerDown={fire("\x1b[B")}>↓</button>
         </div>
-        {/* Row 2: Ctrl + symbols + Backspace */}
+        {/* Row 2: Ctrl + symbols + Space + Backspace */}
         <div className="flex gap-1.5">
           <button
             type="button"
-            className={`${B} flex-1`}
+            className={`${B} flex-[0.8]`}
             style={S}
             onPointerDown={(e) => { e.preventDefault(); setCtrl(true); }}
           >
             Ctrl
           </button>
-          <button type="button" className={`${B} flex-1`} style={S} onPointerDown={fire("@")}>@</button>
-          <button type="button" className={`${B} flex-1`} style={S} onPointerDown={fire("/")}>/</button>
-          <button type="button" className={`${B} flex-1 text-[16px]`} style={S} onPointerDown={fire("\x7f")}>⌫</button>
+          <button type="button" className={`${B} flex-[0.6]`} style={S} onPointerDown={fire("@")}>@</button>
+          <button type="button" className={`${B} flex-[0.6]`} style={S} onPointerDown={fire("/")}>/</button>
+          <button type="button" className={`${B} flex-1`} style={S} onPointerDown={fire(" ")}>Space</button>
+          <button type="button" className={`${B} flex-[0.8] text-[16px]`} style={S} onPointerDown={fire("\x7f")}>⌫</button>
         </div>
         {/* Row 3: ⌃C + Prompt + Enter */}
         <div className="flex gap-1.5">
