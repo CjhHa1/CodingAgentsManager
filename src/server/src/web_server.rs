@@ -612,9 +612,24 @@ async fn handle_socket_attach(mut socket: WebSocket, session_id: SessionId, regi
     let mut live_rx = live_tx.subscribe();
 
     let live_to_ws = async {
-        while let Ok(bytes) = live_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
-                break;
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+        loop {
+            tokio::select! {
+                result = live_rx.recv() => {
+                    match result {
+                        Ok(bytes) => {
+                            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if ws_tx.send(Message::Ping(Bytes::new())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     };
