@@ -102,9 +102,14 @@ export function TerminalView({ session, isActive, viewMode, onSessionState, onSe
     [isDark]
   );
 
+  const destroyedRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectDelayRef = useRef(1000);
+
   const initTerminal = useCallback(async () => {
     if (!fitTargetRef.current || initializedRef.current) return;
     initializedRef.current = true;
+    destroyedRef.current = false;
 
     // Simple mobile detection: disable stdin on touch devices to avoid virtual keyboard / focus issues
     const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -223,95 +228,110 @@ export function TerminalView({ session, isActive, viewMode, onSessionState, onSe
     term.writeln("VibeAround Web Dashboard — connecting…");
 
     const wsUrl = getWebSocketUrl(`/ws?session_id=${encodeURIComponent(session.id)}`);
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-    let dumpReceived = false;
 
-    // Expose sendInput to parent so MobileInputBar can write to PTY.
-    onSendInputReadyRef.current?.((data: string) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(data);
-    });
+    const connectWs = () => {
+      if (destroyedRef.current) return;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+      let dumpReceived = false;
 
-    // Send cols/rows to PTY (already account for padding: fit target is inner div inside padded outer).
-    const sendResize = () => {
-      try {
-        fitAddon.fit();
-        if (ws.readyState === WebSocket.OPEN) {
-          const cols = term.cols;
-          const rows = term.rows;
-          ws.send(JSON.stringify({ type: "resize", cols, rows }));
+      // Expose sendInput to parent so MobileInputBar can write to PTY.
+      onSendInputReadyRef.current?.((data: string) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(data);
+      });
+
+      // Send cols/rows to PTY (already account for padding: fit target is inner div inside padded outer).
+      const sendResize = () => {
+        try {
+          fitAddon.fit();
+          if (ws.readyState === WebSocket.OPEN) {
+            const cols = term.cols;
+            const rows = term.rows;
+            ws.send(JSON.stringify({ type: "resize", cols, rows }));
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
-      }
-    };
+      };
 
-    ws.onopen = () => {
-      term.writeln("\r\nConnected. Receiving history…\r\n");
-      sendResize();
-    };
+      ws.onopen = () => {
+        reconnectDelayRef.current = 1000;
+        term.writeln("\r\nConnected. Receiving history…\r\n");
+        sendResize();
+      };
 
-    // Backend sends: (1) one Binary = dump (history), (2) one Text = state, (3) then Binary = live. On reconnect, clear before dump.
-    ws.onmessage = (ev) => {
-      const data = ev.data;
-      if (data instanceof ArrayBuffer) {
-        const bytes = new Uint8Array(data);
-        if (!dumpReceived) {
-          term.reset();
-          dumpReceived = true;
-          // After dump, sync size so tmux re-renders with correct dimensions.
-          requestAnimationFrame(() => sendResize());
-        }
-        term.write(bytes);
-        return;
-      }
-      if (data instanceof Blob) {
-        data.arrayBuffer().then((buf) => {
-          const bytes = new Uint8Array(buf);
+      // Backend sends: (1) one Binary = dump (history), (2) one Text = state, (3) then Binary = live. On reconnect, clear before dump.
+      ws.onmessage = (ev) => {
+        const data = ev.data;
+        if (data instanceof ArrayBuffer) {
+          const bytes = new Uint8Array(data);
           if (!dumpReceived) {
             term.reset();
             dumpReceived = true;
+            // After dump, sync size so tmux re-renders with correct dimensions.
             requestAnimationFrame(() => sendResize());
           }
           term.write(bytes);
-        });
-        return;
-      }
-      if (typeof data === "string") {
-        try {
-          const msg = JSON.parse(data) as SessionStateMessage;
-          if (msg.type === "running" || msg.type === "exited") {
-            onSessionStateRef.current?.(mapTool(msg.tool), msg.type === "running" ? "running" : msg.exit_code === 0 ? "stopped" : "error");
-            return;
+          return;
+        }
+        if (data instanceof Blob) {
+          data.arrayBuffer().then((buf) => {
+            const bytes = new Uint8Array(buf);
+            if (!dumpReceived) {
+              term.reset();
+              dumpReceived = true;
+              requestAnimationFrame(() => sendResize());
+            }
+            term.write(bytes);
+          });
+          return;
+        }
+        if (typeof data === "string") {
+          try {
+            const msg = JSON.parse(data) as SessionStateMessage;
+            if (msg.type === "running" || msg.type === "exited") {
+              onSessionStateRef.current?.(mapTool(msg.tool), msg.type === "running" ? "running" : msg.exit_code === 0 ? "stopped" : "error");
+              return;
+            }
+          } catch {
+            /* not JSON or not session_state */
           }
-        } catch {
-          /* not JSON or not session_state */
+          if (!dumpReceived) {
+            term.reset();
+            dumpReceived = true;
+          }
+          term.write(data);
+          return;
         }
-        if (!dumpReceived) {
-          term.reset();
-          dumpReceived = true;
-        }
-        term.write(data);
-        return;
-      }
+      };
+
+      ws.onclose = () => {
+        if (destroyedRef.current) return;
+        const delay = reconnectDelayRef.current;
+        term.writeln(`\r\n\r\n[Disconnected. Reconnecting in ${Math.round(delay / 1000)}s…]`);
+        reconnectDelayRef.current = Math.min(delay * 2, 30000);
+        reconnectTimerRef.current = setTimeout(() => {
+          if (!destroyedRef.current) connectWs();
+        }, delay);
+      };
+
+      ws.onerror = () => {
+        // onclose will fire after onerror, so reconnect is handled there
+      };
     };
 
-    ws.onclose = () => {
-      term.writeln("\r\n\r\n[Connection closed. Refresh to reconnect.]");
-    };
-
-    ws.onerror = () => {
-      term.writeln("\r\n\r\n[WebSocket error. Is the app running?]");
-    };
+    connectWs();
 
     const dispose = term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(data);
+      if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(data);
     });
 
     cleanupRef.current = () => {
+      destroyedRef.current = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       removeTouchScroll?.();
       dispose.dispose();
-      ws.close();
+      wsRef.current?.close();
     };
   }, [session.id]);
 
