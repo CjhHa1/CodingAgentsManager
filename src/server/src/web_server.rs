@@ -176,6 +176,75 @@ async fn fs_dirs_handler(Query(q): Query<FsDirsQuery>) -> Json<serde_json::Value
     }))
 }
 
+/// Query params for POST /api/upload.
+#[derive(serde::Deserialize)]
+struct UploadQuery {
+    cwd: Option<String>,
+}
+
+/// POST /api/upload?cwd=<dir> — upload file(s) via multipart/form-data.
+/// Saves files to the specified directory (or system temp if cwd is invalid).
+/// Returns JSON: { "path": "/abs/path/to/file", "name": "filename.ext" }
+async fn upload_handler(
+    Query(q): Query<UploadQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Determine target directory
+    let target_dir: std::path::PathBuf = if let Some(cwd) = q.cwd {
+        let path = std::path::PathBuf::from(&cwd);
+        if path.is_absolute() && path.is_dir() {
+            path
+        } else {
+            std::env::temp_dir()
+        }
+    } else {
+        std::env::temp_dir()
+    };
+
+    // Process multipart fields
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Multipart error: {}", e)})),
+        )
+    })? {
+        let name = field.name().unwrap_or("file").to_string();
+        if name != "file" {
+            continue;
+        }
+
+        let filename = field
+            .file_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("upload_{}", uuid::Uuid::new_v4()));
+
+        let data = field.bytes().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to read file data: {}", e)})),
+            )
+        })?;
+
+        let file_path = target_dir.join(&filename);
+        std::fs::write(&file_path, &data).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to write file: {}", e)})),
+            )
+        })?;
+
+        return Ok(Json(serde_json::json!({
+            "path": file_path.to_string_lossy(),
+            "name": filename,
+        })));
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "No file uploaded"})),
+    ))
+}
+
 /// Runs the Axum server (static files + WebSocket + session API). Binds to 0.0.0.0 (all interfaces).
 /// If feishu_state is Some, POST /api/im/feishu/event handles Feishu webhook (url_verification + events).
 /// Call from desktop via tauri::async_runtime::spawn, or run standalone via the server binary.
@@ -216,6 +285,7 @@ pub async fn run_web_server(
         .route("/api/agents", get(list_agents_handler))
         .route("/api/projects", get(list_projects_handler))
         .route("/api/fs/dirs", get(fs_dirs_handler))
+        .route("/api/upload", post(upload_handler))
         .route("/api/stt", post(stt_handler))
         .route("/api/im/feishu/event", post(feishu_webhook_handler))
         .route("/api/im/feishu/card", post(feishu_card_callback_handler))
